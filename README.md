@@ -173,17 +173,4 @@ npx ts-node src/test-scheduler.ts
 - `GET /api/emails/stats` — queue counts and hourly rate-limit consumption
 - `GET /api/emails/senders` — list sender profiles
 
----
 
-## Known Limitations
-
-This is a demo/portfolio-grade project. Before treating it as production-ready, be aware of:
-
-- **Auth fallback is insecure.** `googleLogin` falls back to `jwt.decode()` (no signature check) if Google's `verifyIdToken` throws, which would let a crafted token authenticate as an arbitrary email. Remove the fallback, or gate it strictly behind `NODE_ENV=development`.
-- **`JWT_SECRET` ships with a hardcoded default** in both the auth code and `.env.example`. Always set a real secret in any non-local environment.
-- **Idempotency doesn't survive rescheduling.** The initial job uses `jobId = dbJob.id` for BullMQ-level dedup, but a rate-limit reschedule creates a new job with a `rescheduled_<id>_<timestamp>` id. `DELETE /api/emails/:id` looks up the job by the original id, so cancelling a job that has already been rescheduled once may not actually remove it from the queue.
-- **Per-email throttling blocks a worker slot.** The min-delay-between-emails is implemented as an `await sleep()` inside the job handler, which occupies a concurrency slot for the full delay instead of using BullMQ's own limiter. Effective throughput is lower than `WORKER_CONCURRENCY` alone suggests.
-- **Startup reconciliation is partial.** It resets `PROCESSING` rows back to `SCHEDULED` in Postgres but doesn't verify or restore the corresponding BullMQ job — if Redis lost that job before the crash, the row won't be retried.
-- **No request-level input validation library** (e.g. Zod) — validation is ad hoc per controller. No rate limiting on the Express API itself (only outbound sends are rate-limited).
-
----
