@@ -187,6 +187,3 @@ This is a demo/portfolio-grade project. Before treating it as production-ready, 
 - **No request-level input validation library** (e.g. Zod) — validation is ad hoc per controller. No rate limiting on the Express API itself (only outbound sends are rate-limited).
 
 ---
-
-## License
-MIT © ReachInbox Engineering
