@@ -1,0 +1,73 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id        String     @id @default(uuid())
+  email     String     @unique
+  name      String?
+  avatar    String?
+  googleId  String?    @unique
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  jobs      EmailJob[]
+
+  @@map("users")
+}
+
+model SenderProfile {
+  id          String     @id @default(uuid())
+  email       String     @unique
+  name        String
+  host        String     @default("smtp.ethereal.email")
+  port        Int        @default(587)
+  user        String
+  pass        String
+  isDefault   Boolean    @default(false)
+  maxPerHour  Int        @default(200)
+  minDelayMs  Int        @default(2000)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  jobs        EmailJob[]
+
+  @@map("sender_profiles")
+}
+
+model EmailJob {
+  id                    String         @id @default(uuid())
+  recipient             String
+  subject               String
+  body                  String
+  senderEmail           String
+  senderProfileId       String?
+  senderProfile         SenderProfile? @relation(fields: [senderProfileId], references: [id], onDelete: SetNull)
+  userId                String?
+  user                  User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  scheduledAt           DateTime
+  executedAt            DateTime?
+  status                String         @default("SCHEDULED")
+  bullmqJobId           String?        @unique
+  batchId               String?
+  etherealUrl           String?
+  errorReason           String?
+  attemptCount          Int            @default(0)
+  rateLimitDelayedUntil DateTime?
+
+  minDelayBetweenEmailsMs Int?         @default(2000)
+  hourlyLimitOverride     Int?         @default(200)
+
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([senderEmail])
+  @@index([batchId])
+  @@map("email_jobs")
+}
