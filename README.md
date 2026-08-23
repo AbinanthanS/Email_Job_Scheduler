@@ -1,200 +1,145 @@
-# ReachInbox High-Throughput Email Scheduler & Dashboard
+# ReachInbox — High-Throughput Email Scheduler & Dashboard
 
-A production-grade, distributed email scheduling service and modern dashboard engineered with **TypeScript**, **Express.js**, **BullMQ + Redis**, **PostgreSQL / Prisma ORM**, **Ethereal fake SMTP**, and **React 18 + Tailwind CSS**.
+A distributed email scheduling service with a live dashboard, built on **TypeScript**, **Express**, **BullMQ + Redis**, **PostgreSQL / Prisma**, **Ethereal fake SMTP**, and **React 18 + Tailwind CSS**.
+
+It schedules large batches of emails, staggers delivery per-recipient, enforces a per-sender hourly send limit without dropping jobs, and survives server restarts.
 
 ---
 
-## 🏛️ System Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    A[Frontend Dashboard<br/>React + Tailwind + Vite] -->|REST API + JWT| B[Express.js API Server]
-    B -->|Persist Metadata| C[(PostgreSQL Database<br/>Prisma ORM)]
-    B -->|Delayed Job Enqueue| D[(Redis 7<br/>BullMQ Delayed Queue)]
-    
-    subgraph BullMQ Worker Pool [BullMQ Distributed Worker Pool]
-        W1[Worker Instance 1]
-        W2[Worker Instance 2]
-        W3[Worker Instance N]
+    A[Frontend Dashboard<br/>React + Tailwind + Vite] -->|REST API + JWT| B[Express API Server]
+    B -->|Persist metadata| C[(PostgreSQL<br/>Prisma ORM)]
+    B -->|Enqueue delayed job| D[(Redis<br/>BullMQ delayed queue)]
+
+    subgraph Workers [BullMQ Worker Pool]
+        W1[Worker 1]
+        W2[Worker 2]
+        W3[Worker N]
     end
-    
-    D -->|Pop Due Jobs at target timestamp| BullMQ Worker Pool
-    BullMQ Worker Pool -->|Atomic Check & Increment| R[(Redis Rate Limiter<br/>Lua Script)]
-    
-    R -->|Limit Exceeded| ReQ[Auto-Reschedule into Next Hour Window]
+
+    D -->|Pop job at target timestamp| Workers
+    Workers -->|Atomic check & increment| R[(Redis rate limiter<br/>Lua script)]
+
+    R -->|Limit exceeded| ReQ[Reschedule into next hour window]
     ReQ --> D
-    
-    R -->|Allowed & Throttled| S[Ethereal SMTP Dispatcher<br/>Nodemailer Transporter Pool]
-    S -->|Delivery Success + Preview URL| C
-    S -->|Render Web Inbox| E[Ethereal Web Inbox Viewer]
+
+    R -->|Allowed| S[Ethereal SMTP dispatcher<br/>Nodemailer]
+    S -->|Delivery result + preview URL| C
+    S -->|Rendered inbox| E[Ethereal web inbox]
 ```
 
 ---
 
-## 🚀 Key Features & Architectural Highlights
+## How It Works
 
-### 1. No Cron Jobs — Pure BullMQ Persistent Delayed Queues
-- **Why No Cron?** Traditional cron pollers (e.g. `node-cron`, `crontab`) poll the database at fixed intervals (e.g. every minute), causing database locking, scalability bottlenecks, race conditions across multiple instances, and latency spikes.
-- **BullMQ Architecture**: We utilize Redis native Sorted Sets (`ZSET`) where delayed jobs are scored by their target execution Unix timestamp (`targetTimestampMs`). Redis natively pops jobs at the exact millisecond they are due.
-- **Strict Idempotency**: Each job is registered with `jobId = emailJob.id` (PostgreSQL CUID/UUID). If a duplicate request or network retry occurs, BullMQ deduplicates it at the Redis level.
+### 1. Delayed queues instead of cron
+Cron pollers (`node-cron`, crontab) hit the database on a fixed interval, which causes lock contention, race conditions across instances, and delivery latency proportional to the poll interval. Instead, each scheduled email becomes a Redis sorted-set entry (BullMQ `delay`) scored by its target execution timestamp, so Redis pops it at the exact millisecond it's due — no polling loop.
 
-### 2. Configurable Worker Concurrency
-- Configured via `WORKER_CONCURRENCY` in `.env` (default `5` concurrent workers per process).
-- Multiple workers can run across multiple server instances in a distributed cluster without race conditions or job duplication.
+Each job's BullMQ `jobId` is set to the Postgres `EmailJob.id`, so a duplicate schedule request or network retry is deduplicated at the Redis level for the **initial** enqueue. (See [Known Limitations](#known-limitations) — this guarantee doesn't currently extend to rescheduled jobs.)
 
-### 3. Provider Throttling (Minimum Delay Between Sends)
-- Configurable via `DEFAULT_MIN_DELAY_BETWEEN_EMAILS_MS` (default: **2000ms / 2 seconds** between sends).
-- Simulates real-world email deliverability warmup and provider throttling to prevent IP rate-limiting or domain reputation penalties.
+### 2. Configurable worker concurrency
+`WORKER_CONCURRENCY` (default `5`) controls how many jobs a single worker process handles in parallel. Multiple worker processes/instances can run against the same queue without duplicate delivery.
 
-### 4. Distributed Hourly Rate Limiter & Non-Dropping Rescheduling
-- **Redis Atomic Key**: `ratelimit:sender:<senderEmail>:<YYYY-MM-DD-HH>`
-- **Lua Script Atomic Check & Increment**:
-  ```lua
-  local current = redis.call('GET', KEYS[1])
-  if current and tonumber(current) >= tonumber(ARGV[1]) then
-    return {0, tonumber(current)}
-  else
-    local newCount = redis.call('INCR', KEYS[1])
-    if newCount == 1 then
-      redis.call('EXPIRE', KEYS[1], 7200)
-    end
-    return {1, newCount}
+### 3. Per-recipient throttling
+`DEFAULT_MIN_DELAY_BETWEEN_EMAILS_MS` (default `2000`) simulates provider warm-up pacing between consecutive sends from the same batch.
+
+### 4. Distributed hourly rate limiting
+Each sender has a Redis counter keyed `ratelimit:sender:<email>:<YYYY-MM-DD-HH>`, checked and incremented atomically in one round trip:
+
+```lua
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) >= tonumber(ARGV[1]) then
+  return {0, tonumber(current)}
+else
+  local newCount = redis.call('INCR', KEYS[1])
+  if newCount == 1 then
+    redis.call('EXPIRE', KEYS[1], 7200)
   end
-  ```
-- **Behavior Under Heavy Load (1000+ Emails)**:
-  - If 1,000 emails are scheduled simultaneously and exceed the sender's hourly limit (e.g. 200/hr):
-  - **No jobs are dropped or marked failed.**
-  - The worker calculates the exact millisecond offset until the start of the next hour window (`nextHourStartMs - Date.now()`).
-  - The job status in PostgreSQL is updated to `RESCHEDULED`, and BullMQ pushes the delayed job into the next hour window while preserving order.
+  return {1, newCount}
+end
+```
 
-### 5. Crash Resilience & Server Restart Recovery
-- If the backend server or worker pool crashes or restarts:
-  - BullMQ persistent Redis sorted sets retain all future scheduled jobs.
-  - On application startup, `schedulerService.reconcileOnStartup()` runs an automated reconciliation query to reconcile any in-flight jobs and ensure zero dropped deliveries.
+If a sender exceeds their hourly limit (e.g. 200/hr) under load, jobs are **not** dropped or marked failed — the worker computes the exact offset to the next hour boundary, marks the row `RESCHEDULED` in Postgres, and re-enqueues it as a new delayed job.
 
-### 6. Fake SMTP (Ethereal Email) with Live Web Preview
-- Uses Nodemailer with automatic dynamic Ethereal test account generation on first launch.
-- Dispatched emails generate a clickable `nodemailer.getTestMessageUrl(info)` link saved in the database, allowing users to view formatted rendered HTML emails directly in their browser.
+### 5. Restart recovery
+BullMQ's Redis-backed sorted sets survive process restarts, so already-enqueued future jobs aren't lost. On boot, `schedulerService.reconcileOnStartup()` resets any row stuck in `PROCESSING` (i.e. the worker died mid-send) back to `SCHEDULED`.
 
-### 7. Modern Frontend Dashboard
-- Built with **React 18**, **TypeScript**, **Tailwind CSS**, and **Lucide Icons**.
-- Real **Google OAuth 2.0** login via `@react-oauth/google` with 1-Click Demo Login fallback.
-- Drag & Drop **CSV / TXT Lead Parser** (detects and deduplicates emails on the fly).
-- Live **Queue Health & Rate Limiter Monitor**.
-- Searchable **Scheduled Emails** & **Sent Emails** tables with direct Ethereal view links.
-- 4-second live auto-refresh polling.
+> Note: this reconciliation currently only fixes up Postgres state — see [Known Limitations](#known-limitations) for what it doesn't cover.
+
+### 6. Fake SMTP with live preview
+Uses Nodemailer against Ethereal Email. If `ETHEREAL_USER`/`ETHEREAL_PASS` aren't set, a disposable test account is generated automatically on startup. Every sent message stores a clickable `getTestMessageUrl()` link so you can view the rendered HTML in a browser.
+
+### 7. Dashboard
+React 18 + TypeScript + Tailwind, with:
+- Google OAuth login (`@react-oauth/google`) plus a one-click demo login
+- Drag-and-drop CSV/TXT recipient parsing with dedup
+- Live queue health and rate-limit usage panel
+- Searchable scheduled/sent tables with Ethereal links
+- 4-second polling for near-live updates
 
 ---
 
-## 📦 Project Structure
+## Project Structure
 
 ```
 Email_Job_Scheduler/
-├── docker-compose.yml              # Redis 7 & PostgreSQL 16 containers
+├── docker-compose.yml            # Redis 7 & PostgreSQL 16
 ├── backend/
 │   ├── prisma/
-│   │   ├── schema.prisma           # PostgreSQL schema (User, EmailJob, SenderProfile)
-│   │   └── schema.sqlite.prisma    # SQLite fallback schema
-│   ├── src/
-│   │   ├── config/                 # Redis connection & Prisma client
-│   │   ├── controllers/            # Auth, Email, Analytics controllers
-│   │   ├── middleware/             # Auth JWT verification
-│   │   ├── queues/                 # BullMQ queue definition & events
-│   │   ├── workers/                # BullMQ email worker & concurrency logic
-│   │   ├── services/               # SMTP service, Rate limiter, Scheduler
-│   │   ├── routes/                 # Express REST API routes
-│   │   ├── test-scheduler.ts       # E2E test script
-│   │   └── server.ts               # Server entry & graceful shutdown
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── .env
+│   │   ├── schema.prisma         # PostgreSQL schema
+│   │   └── schema.sqlite.prisma  # SQLite fallback
+│   └── src/
+│       ├── config/               # Redis connection, Prisma client
+│       ├── controllers/          # Auth, email, analytics
+│       ├── middleware/           # JWT auth
+│       ├── queues/               # BullMQ queue definition
+│       ├── workers/              # BullMQ worker & concurrency logic
+│       ├── services/             # SMTP, rate limiter, scheduler
+│       ├── routes/               # Express routes
+│       ├── test-scheduler.ts     # E2E test script
+│       └── server.ts             # Entry point, graceful shutdown
 └── frontend/
-    ├── src/
-    │   ├── components/             # Navbar, StatCards, ComposeModal, ScheduledTable, SentTable, QueueHealthDrawer
-    │   ├── context/                # AuthContext, ToastContext
-    │   ├── pages/                  # DashboardPage, LoginPage
-    │   ├── services/               # Axios API client
-    │   ├── types/                  # TypeScript interfaces
-    │   ├── App.tsx
-    │   ├── main.tsx
-    │   └── index.css               # Tailwind CSS & Glassmorphism design tokens
-    ├── package.json
-    ├── vite.config.ts
-    ├── tailwind.config.js
-    └── tsconfig.json
+    └── src/
+        ├── components/           # Navbar, StatCards, ComposeModal, tables, QueueHealthDrawer
+        ├── context/               # AuthContext, ToastContext
+        ├── pages/                 # DashboardPage, LoginPage
+        ├── services/               # Axios client
+        └── types/
 ```
 
 ---
 
-## 🛠️ Setup & Running
+## Setup
 
 ### Prerequisites
-- **Node.js**: v18+ (tested on Node 24.9)
-- **Docker Desktop** (or local Redis + PostgreSQL)
+- Node.js 18+ (tested on 24.9)
+- Docker Desktop (or local Redis + PostgreSQL)
 
----
-
-### Step 1: Start Redis & PostgreSQL with Docker
-
+### 1. Start Redis & PostgreSQL
 ```bash
 docker compose up -d
 ```
+Starts `reachinbox_redis` (`6379`) and `reachinbox_postgres` (`5432`) with health checks.
 
-*(This starts `reachinbox_redis` on port `6379` and `reachinbox_postgres` on port `5432` with health checks).*
+### 2. Backend
+```bash
+cd backend
+cp .env.example .env   # then set a real JWT_SECRET — see Security notes below
+npx prisma db push
+npm run dev
+```
 
----
+### 3. Frontend
+```bash
+cd frontend
+npm run dev
+```
+Open [http://localhost:5173](http://localhost:5173).
 
-### Step 2: Configure & Start Backend
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-
-2. Review `.env` configuration (default values are already pre-filled for local development):
-   ```ini
-   PORT=5000
-   DATABASE_URL="postgresql://reachinbox_user:reachinbox_password@localhost:5432/reachinbox_db?schema=public"
-   REDIS_HOST=localhost
-   REDIS_PORT=6379
-   WORKER_CONCURRENCY=5
-   DEFAULT_MIN_DELAY_BETWEEN_EMAILS_MS=2000
-   DEFAULT_MAX_EMAILS_PER_HOUR=200
-   JWT_SECRET=reachinbox_super_secure_jwt_secret_key_2026
-   ```
-
-3. Push the database schema:
-   ```bash
-   npx prisma db push
-   ```
-
-4. Start the backend development server:
-   ```bash
-   npm run dev
-   ```
-
----
-
-### Step 3: Start Frontend
-
-1. In a new terminal, navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Start the Vite development server:
-   ```bash
-   npm run dev
-   ```
-
-3. Open [http://localhost:5173](http://localhost:5173) in your browser.
-
----
-
-## 🧪 Running Automated E2E Tests
-
-To run the automated scheduler, BullMQ queue, and Redis rate-limiting integration test suite:
-
+### Run the E2E test script
 ```bash
 cd backend
 npx ts-node src/test-scheduler.ts
@@ -202,15 +147,15 @@ npx ts-node src/test-scheduler.ts
 
 ---
 
-## 📡 API Reference
+## API Reference
 
-### 1. Auth APIs
-- `POST /api/auth/google` - Authenticate with Google ID token credential
-- `POST /api/auth/demo` - 1-Click Demo login for local testing
-- `GET /api/auth/me` - Fetch authenticated user profile
+**Auth**
+- `POST /api/auth/google` — authenticate with a Google ID token
+- `POST /api/auth/demo` — one-click demo login (local/dev only, see Security notes)
+- `GET /api/auth/me` — fetch the authenticated user
 
-### 2. Email Scheduling APIs
-- `POST /api/emails/schedule` - Schedule a batch of leads
+**Email scheduling**
+- `POST /api/emails/schedule` — schedule a batch
   ```json
   {
     "recipients": ["lead1@example.com", "lead2@example.com"],
@@ -222,13 +167,26 @@ npx ts-node src/test-scheduler.ts
     "senderName": "ReachInbox Team"
   }
   ```
-- `GET /api/emails/scheduled?search=&page=1&limit=20` - Retrieve scheduled queue
-- `GET /api/emails/sent?search=&page=1&limit=20` - Retrieve sent emails with Ethereal preview links
-- `DELETE /api/emails/:id` - Cancel a scheduled email job
-- `GET /api/emails/stats` - BullMQ queue counts and hourly rate limit consumption
-- `GET /api/emails/senders` - List sender profiles
+- `GET /api/emails/scheduled?search=&page=1&limit=20`
+- `GET /api/emails/sent?search=&page=1&limit=20`
+- `DELETE /api/emails/:id` — cancel a scheduled job
+- `GET /api/emails/stats` — queue counts and hourly rate-limit consumption
+- `GET /api/emails/senders` — list sender profiles
 
 ---
 
-## 🛡️ License
+## Known Limitations
+
+This is a demo/portfolio-grade project. Before treating it as production-ready, be aware of:
+
+- **Auth fallback is insecure.** `googleLogin` falls back to `jwt.decode()` (no signature check) if Google's `verifyIdToken` throws, which would let a crafted token authenticate as an arbitrary email. Remove the fallback, or gate it strictly behind `NODE_ENV=development`.
+- **`JWT_SECRET` ships with a hardcoded default** in both the auth code and `.env.example`. Always set a real secret in any non-local environment.
+- **Idempotency doesn't survive rescheduling.** The initial job uses `jobId = dbJob.id` for BullMQ-level dedup, but a rate-limit reschedule creates a new job with a `rescheduled_<id>_<timestamp>` id. `DELETE /api/emails/:id` looks up the job by the original id, so cancelling a job that has already been rescheduled once may not actually remove it from the queue.
+- **Per-email throttling blocks a worker slot.** The min-delay-between-emails is implemented as an `await sleep()` inside the job handler, which occupies a concurrency slot for the full delay instead of using BullMQ's own limiter. Effective throughput is lower than `WORKER_CONCURRENCY` alone suggests.
+- **Startup reconciliation is partial.** It resets `PROCESSING` rows back to `SCHEDULED` in Postgres but doesn't verify or restore the corresponding BullMQ job — if Redis lost that job before the crash, the row won't be retried.
+- **No request-level input validation library** (e.g. Zod) — validation is ad hoc per controller. No rate limiting on the Express API itself (only outbound sends are rate-limited).
+
+---
+
+## License
 MIT © ReachInbox Engineering
